@@ -1,0 +1,332 @@
+---
+title: "Working Capital Forecasting Dashboard"
+output: 
+  flexdashboard::flex_dashboard
+date: '2022-07-29'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+```{r, packages, results="hide", , message = FALSE}
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(fable)
+library(feasts)
+
+library(patchwork)
+library(GGally)
+library(knitr)
+library(printr)
+library(DT)
+```
+```{r, import and clean data, results="hide", , message = FALSE}
+google_gl <- read_csv("C:\\Users\\AxelTorbenson\\OneDrive - eCapital Advisors, LLC\\Documents\\templates\\CapitalForecasting\\Data\\goog_gl.csv")
+
+gl <- google_gl %>%
+  select(
+    # date and totals
+    fiscalDateEnding,
+    totalCurrentAssets,
+    totalCurrentLiabilities,
+    # assets
+    inventory,
+    cashAndCashEquivalentsAtCarryingValue, 
+    currentNetReceivables,
+    shortTermInvestments,
+    otherCurrentAssets,
+    # liabilities
+    shortTermDebt,
+    currentAccountsPayable,
+    otherCurrentLiabilities) %>%
+  mutate(workingCapital = totalCurrentAssets - totalCurrentLiabilities,
+         otherCurrentAssets = totalCurrentAssets
+         - inventory
+         - cashAndCashEquivalentsAtCarryingValue
+         - currentNetReceivables 
+         - shortTermInvestments,
+         # otherCurrentLiabilities includes taxes, deferred revenue, capital lease obligations, and other
+         otherCurrentLiabilities = totalCurrentLiabilities
+         - shortTermDebt 
+         - currentAccountsPayable,
+         # NA is equivalent to 0
+         across(where(is.numeric), ~replace(., is.na(.), 0)),
+         # Make data in millions
+         across(c(2:12), .fns = ~./1000000),
+         # Liabilities are negative
+         across(c("shortTermDebt", "currentAccountsPayable", "otherCurrentLiabilities"), .fns = ~. * -1)) %>% 
+  select(-workingCapital, -totalCurrentAssets, -totalCurrentLiabilities) %>% 
+  pivot_longer(!fiscalDateEnding, values_to = "dollars") %>%
+  group_by(name) %>%
+  mutate(accountType = case_when(
+    name %in% c(
+      "inventory",
+      "cashAndCashEquivalentsAtCarryingValue",
+      "currentNetReceivables",
+      "shortTermInvestments",
+      "otherCurrentAssets"
+    ) ~ "asset",
+    name %in% c(
+      "shortTermDebt",
+      "currentAccountsPayable",
+      "otherCurrentLiabilities"
+    ) ~ "liability")
+  )
+
+df <- gl %>%
+  mutate(fiscalDateEnding = yearmonth(fiscalDateEnding)) %>%
+  as_tsibble(key = dollars, index = fiscalDateEnding) %>%
+  aggregate_key((accountType / name), dollars = sum(dollars)) 
+
+ind_models <- df %>% 
+  # withholding 5 quarters of data (training)
+  filter(year(fiscalDateEnding) <= 2020) %>%
+  # AICc is better for short time series
+  model(arima = ARIMA(dollars, ic = "aicc"),
+        ets = ETS(dollars, ic = "aicc"),
+        naive = NAIVE(dollars ~ drift()))
+
+refit_comb <- ind_models %>%
+  refit(df) %>%
+  mutate(comb = (arima + ets + naive) / 3) %>%
+  reconcile(mint_comb = min_trace(comb, method = "mint_shrink")) %>% 
+  select(accountType, name, mint_comb)
+
+# refits forecast and uses newest data
+refit_forecast <- refit_comb %>% 
+  forecast(h = 5) %>% 
+  hilo(95) %>%
+  as_tibble() %>%
+  select(fiscalDateEnding, accountType, name, .mean, '95%') %>%
+  rename(dollars = .mean) %>%
+  rename(conf_int = '95%') %>%
+  unpack_hilo(conf_int) %>% 
+  mutate(type = "forecast")
+
+df_final <- df %>%
+  mutate(conf_int_lower = NA,
+         conf_int_upper = NA,
+         type = "actual")
+
+full_df = union_all(refit_forecast, df_final)
+```
+
+# Working Capital Forecast
+
+## Column {.tabset .tabset-fade}
+
+### Stacked area assets and Liabilities
+
+```{r, stacked area charts}
+sa_assets <- gl %>%
+  filter(
+    name %in% c(
+      "fiscalDateEnding",
+      "inventory",
+      "cashAndCashEquivalentsAtCarryingValue",
+      "currentNetReceivables",
+      "shortTermInvestments",
+      "otherCurrentAssets"
+    )
+  ) %>%
+  mutate(name=replace(name, name=="cashAndCashEquivalentsAtCarryingValue", "cash")) %>% 
+  ggplot(aes(x = fiscalDateEnding, y = dollars, fill = name)) +
+  geom_area() +
+  labs(title = "Assets") +
+  scale_fill_brewer(palette = "Pastel1")
+
+
+sa_liabilities <- gl %>%
+  filter(
+    name %in% c(
+      "fiscalDateEnding",
+      "shortTermDebt",
+      "currentAccountsPayable",
+      "otherCurrentLiabilities"
+    )
+  ) %>%
+  mutate(dollars = abs(dollars)) %>%
+           ggplot(aes(x = fiscalDateEnding, y = dollars, fill = name)) +
+           geom_area() + 
+           labs(title = "Liabilities") +
+           scale_fill_brewer(palette = "Pastel1")
+
+sa_assets / sa_liabilities
+```
+
+## Column {.tabset .tabset-fade}
+
+### Working Capital Forecasting
+
+```{r, working capital forecast}
+refit_comb %>%
+  forecast(h=5) %>% 
+  filter(is_aggregated(name), is_aggregated(accountType)) %>%
+  filter(.model == "mint_comb") %>% 
+  autoplot(df) +
+  facet_wrap(vars(name), scales = "free_y") +
+  labs(y = "Dollars (millions)", x = "Date", title = "Working Capital forecast") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 160000), labels = function(x) format(x, scientific = FALSE)) 
+```
+
+### Working Capital Simulation
+
+```{r, working capital simulation}
+simulation <- generate(refit_comb, h = 5, times = 10) %>%
+  filter(is_aggregated(name), is_aggregated(accountType)) %>% 
+  filter(.model == 'mint_comb')
+df %>%
+  filter(is_aggregated(name), is_aggregated(accountType)) %>%
+  autoplot(dollars) + 
+  autolayer(simulation, .vars = .sim) +
+  geom_line() +
+  theme(legend.position = "none") +
+  ggtitle("Working Capital Simulation") +
+  labs(y = "Dollars (millions)", x = "Date") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 160000), labels = function(x) format(x, scientific = FALSE))
+```
+
+# GL components forecast
+
+## Column {.tabset .tabset-fade}
+
+### Assets
+
+```{r, assets}
+refit_comb %>%
+  forecast(h=5) %>% 
+  filter(is_aggregated(name), accountType == "asset") %>%
+  filter(.model == "mint_comb") %>% 
+  autoplot(df) +
+  facet_wrap(vars(name), scales = "free_y") +
+  labs(y = "Dollars (millions)", x = "Date", title = "Assets Forecast")
+```
+
+### Asset Components
+
+```{r, assets components}
+five_period_forecast <- refit_comb %>%
+  forecast(h=5)
+components_plot <- function(gl_component, account_type) {
+  five_period_forecast %>% 
+    filter(name == gl_component, accountType == account_type) %>%
+    filter(.model == "mint_comb") %>% 
+    autoplot(df) +
+    facet_wrap(vars(name), scales = "free_y") +
+    labs(y = "", x = "") +
+    theme(legend.position = "none")
+}
+
+(components_plot("cashAndCashEquivalentsAtCarryingValue", "asset") + components_plot("currentNetReceivables", "asset")) /
+  (components_plot("inventory", "asset") + components_plot("otherCurrentAssets", "asset")) /
+  components_plot("shortTermInvestments", "asset")
+```
+
+## Column {.tabset .tabset-fade}
+
+### Liabilities
+
+```{r, liabilities}
+refit_comb %>%
+  forecast(h=5) %>% 
+  filter(is_aggregated(name), accountType == "liability") %>%
+  filter(.model == "mint_comb") %>% 
+  autoplot(df) +
+  facet_wrap(vars(name), scales = "free_y") +
+  labs(y = "Dollars (millions)", x = "Date", title = "Liabilities Forecast")
+```
+
+### Liabilities Components
+
+```{r, liabilities components}
+(components_plot("currentAccountsPayable", "liability") + components_plot("shortTermDebt", "liability")) /
+  components_plot("otherCurrentLiabilities", "liability")
+```
+
+# Accuracy and hierarchy
+
+## Column
+
+### Accuracy
+
+```{r, accuracy}
+# This combination model is just to get the error of the model
+comb_forecast_accuracy <- ind_models %>%
+  mutate(comb = (arima + ets + naive) / 3) %>%
+  reconcile(mint_comb = min_trace(comb, method = "mint_shrink")) %>% 
+  forecast(h = 5) %>% 
+  filter(.model == "mint_comb") %>% 
+  # MAPE is infinity when a series has 0 in it
+  accuracy(data = df, measures = c(mape = MAPE, mae = MAE, mase = MASE)) %>% 
+  select(accountType, name, mape, mae, mase) %>% 
+  mutate(mape = round(mape, 3), mae = round(mae, 3), mase = round(mase, 3))
+
+datatable(comb_forecast_accuracy %>% 
+  mutate(accountType = as.character(accountType), name = as.character(name)),
+  class = 'cell-border stripe')
+```
+
+## Column
+
+### Hierarchical Structure
+
+```{r, hierarchy}
+library(ggraph)
+library(igraph)
+  
+# create a data frame
+data <- data.frame(
+  level1="Working Capital",
+  level2=c(rep(" Current Assets", 5), rep("Current Liabilities", 3)),
+  level3=c("Inventory",
+      "Net Receivables",
+      "Cash",
+      "Investments",
+      "other",
+      "Debt",
+      "Acc Payable",
+      "other")
+)
+  
+# transform it to a edge list!
+edges_level1_2 <- data %>% select(
+  level1, level2) %>% unique %>% rename(
+  from=level1, to=level2)
+ 
+edges_level2_3 <- data %>% select(
+  level2, level3) %>% unique %>% rename(
+  from=level2, to=level3)
+ 
+edge_list=rbind(edges_level1_2, edges_level2_3)
+
+# Now we can plot that
+graph_Data <- graph_from_data_frame( edge_list )
+suppressMessages(ggraph(graph_Data, layout = 'dendrogram') +
+  geom_edge_diagonal(color = "azure4") +
+  geom_node_text(aes(label=name), color="cornflowerblue") +
+  theme_void() +
+  theme(legend.position = "none"))
+```
+
+# Data
+
+## Column
+
+### Data
+
+```{r, table}
+table_df <- full_df %>% 
+  mutate(accountType = as.character(accountType), 
+         name = as.character(name),
+         fiscalDateEnding = as.character(fiscalDateEnding)) %>% 
+  mutate_if(is.numeric, round, 2) %>% 
+  mutate(name=replace(name, name=="cashAndCashEquivalentsAtCarryingValue", "cash"))
+
+
+datatable(
+  table_df,
+  class = 'cell-border stripe',
+  fillContainer = TRUE
+)
+```
