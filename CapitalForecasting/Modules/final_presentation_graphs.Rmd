@@ -1,0 +1,215 @@
+---
+title: "Untitled"
+author: "Axel Torbenson, Data Science Intern"
+date: '2022-08-08'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(fable)
+library(feasts)
+
+google_gl <- read_csv("C:\\Users\\AxelTorbenson\\OneDrive - eCapital Advisors, LLC\\Documents\\templates\\CapitalForecasting\\Data\\gl_google.csv")
+
+gl <- google_gl %>%
+  select(
+    # date and totals
+    fiscalDateEnding,
+    totalCurrentAssets,
+    totalCurrentLiabilities,
+    # assets
+    inventory,
+    cashAndCashEquivalentsAtCarryingValue, 
+    currentNetReceivables,
+    shortTermInvestments,
+    otherCurrentAssets,
+    # liabilities
+    shortTermDebt,
+    currentAccountsPayable,
+    otherCurrentLiabilities) %>%
+  mutate(workingCapital = totalCurrentAssets - totalCurrentLiabilities,
+         otherCurrentAssets = totalCurrentAssets
+         - inventory
+         - cashAndCashEquivalentsAtCarryingValue
+         - currentNetReceivables 
+         - shortTermInvestments,
+         # otherCurrentLiabilities includes taxes, deferred revenue, capital lease obligations, and other
+         otherCurrentLiabilities = totalCurrentLiabilities
+         - shortTermDebt 
+         - currentAccountsPayable,
+         # NA is equivalent to 0
+         across(where(is.numeric), ~replace(., is.na(.), 0)),
+         # Make data in millions
+         across(c(2:12), .fns = ~./1000000),
+         # Liabilities are negative
+         across(c("shortTermDebt", "currentAccountsPayable", "otherCurrentLiabilities"), .fns = ~. * -1)) %>% 
+  select(-workingCapital, -totalCurrentAssets, -totalCurrentLiabilities) %>% 
+  pivot_longer(!fiscalDateEnding, values_to = "dollars") %>%
+  group_by(name) %>%
+  mutate(accountType = case_when(
+    name %in% c(
+      "inventory",
+      "cashAndCashEquivalentsAtCarryingValue",
+      "currentNetReceivables",
+      "shortTermInvestments",
+      "otherCurrentAssets"
+    ) ~ "asset",
+    name %in% c(
+      "shortTermDebt",
+      "currentAccountsPayable",
+      "otherCurrentLiabilities"
+    ) ~ "liability")
+  )
+
+df <- gl %>%
+  mutate(fiscalDateEnding = yearmonth(fiscalDateEnding)) %>%
+  as_tsibble(key = dollars, index = fiscalDateEnding) %>%
+  aggregate_key((accountType / name), dollars = sum(dollars)) 
+
+ind_models <- df %>% 
+  # withholding 5 quarters of data (training)
+  filter(year(fiscalDateEnding) <= 2020) %>%
+  # AICc is better for short time series
+  model(arima = ARIMA(dollars, ic = "aicc"),
+        ets = ETS(dollars, ic = "aicc"),
+        naive = NAIVE(dollars ~ drift())) %>% 
+  reconcile(mint_arima = min_trace(arima, method = "mint_shrink"),
+            mint_ets = min_trace(ets, method = "mint_shrink"),
+            mint_naive = min_trace(naive, method = "mint_shrink"))
+
+refit_comb <- ind_models %>%
+  refit(df) %>%
+  mutate(comb = (arima + ets + naive) / 3) %>%
+  reconcile(mint_comb = min_trace(comb, method = "mint_shrink"))
+```
+
+```{r, point}
+refit_comb %>%
+  forecast(h=5) %>% 
+  filter(name == "inventory") %>%
+  filter(.model == "mint_comb") %>% 
+  autoplot(df, level = NULL, color = "red", show_gap = FALSE) +
+  facet_wrap(vars(name), scales = "free_y") +
+  labs(y = "Dollars (millions)", x = "", title = "") +
+  theme(strip.background = element_blank(), strip.text = element_blank()) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 3000), labels = function(x) format(x, scientific = FALSE))
+
+ggsave("C:\\Users\\AxelTorbenson\\OneDrive - eCapital Advisors, LLC\\Pictures\\point_forecast.tiff", dpi = 300, width = 9, height = 6)
+```
+
+```{r, simulation}
+simulation_graph <- function(num_sim) {
+  simulation <- refit_comb %>% 
+  select(accountType, name, mint_comb) %>% 
+  generate(h = 5, times = num_sim) %>%
+  filter(name == "inventory") %>% 
+  filter(.model == 'mint_comb')
+  
+  for (i in 1:num_sim){
+    simulation <- simulation %>%
+      add_row(
+        accountType = "asset",
+        name = "inventory",
+        .model = "mint_comb",
+        fiscalDateEnding = yearmonth("2022 Mar"),
+        .rep = as.character(i),
+        .sim = 1369
+      )
+    }
+    
+  df %>%
+    filter(name == "inventory") %>%
+    autoplot(dollars) + 
+    autolayer(simulation, .vars = .sim) +
+    geom_line() +
+    labs(y = "Dollars (millions)", x = "") +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, 3000), labels = function(x) format(x, scientific = FALSE)) + 
+    theme(legend.position = "none")
+}
+
+simulation_graph(10)
+ggsave("C:\\Users\\AxelTorbenson\\OneDrive - eCapital Advisors, LLC\\Pictures\\sim_10.tiff", dpi = 300, width = 9, height = 6)
+simulation_graph(100)
+ggsave("C:\\Users\\AxelTorbenson\\OneDrive - eCapital Advisors, LLC\\Pictures\\sim_100.tiff", dpi = 300, width = 9, height = 6)
+simulation_graph(1000)
+ggsave("C:\\Users\\AxelTorbenson\\OneDrive - eCapital Advisors, LLC\\Pictures\\sim_1000.tiff", dpi = 300, width = 9, height = 6)
+```
+
+
+```{r, distribution}
+refit_comb %>%
+  forecast(h=5) %>% 
+  filter(name == "inventory") %>%
+  filter(.model == "mint_comb") %>% 
+  autoplot(df, show_gap = FALSE, level = seq(10, 90, by=10)) +
+  facet_wrap(vars(name), scales = "free_y") +
+  labs(y = "Dollars (millions)", x = "", title = "") +
+  theme(strip.background = element_blank(), strip.text = element_blank()) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 3000), labels = function(x) format(x, scientific = FALSE)) +
+  theme(legend.position = "none")
+ggsave("C:\\Users\\AxelTorbenson\\OneDrive - eCapital Advisors, LLC\\Pictures\\fan_dist.tiff", dpi = 300, width = 9, height = 6)
+```
+
+```{r}
+refit_comb %>%
+  forecast(h=5) %>% 
+  filter(name == "inventory") %>%
+  filter(.model == "mint_comb") %>% 
+  autoplot(df, show_gap = FALSE) +
+  facet_wrap(vars(name), scales = "free_y") +
+  labs(y = "Dollars (millions)", x = "", title = "") +
+  theme(strip.background = element_blank(), strip.text = element_blank()) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 3000), labels = function(x) format(x, scientific = FALSE)) +
+  labs(title = "Distributional forecast of inventory")
+
+ggsave("C:\\Users\\AxelTorbenson\\OneDrive - eCapital Advisors, LLC\\Pictures\\dist_plot_title.tiff", dpi = 300, width = 9, height = 6)
+```
+```{r, accuracy}
+# This combination model is just to get the error of the model
+comb_forecast_accuracy <- ind_models %>%
+  mutate(comb = (arima + ets + naive) / 3) %>%
+  reconcile(mint_comb = min_trace(comb, method = "mint_shrink")) %>% 
+  forecast(h = 5) %>% 
+  # MAPE is infinity when a series has 0 in it
+  accuracy(data = df, measures = c(mape = MAPE, mae = MAE, mase = MASE, crps = CRPS)) %>% 
+  select(accountType, name, .model, mape, mae, mase, crps) %>% 
+  mutate(mape = round(mape, 3), mae = round(mae, 3), mase = round(mase, 3), crps = round(crps, 3))
+
+datatable(comb_forecast_accuracy %>% 
+  mutate(accountType = as.character(accountType), name = as.character(name)),
+  class = 'cell-border stripe',
+  fillContainer = TRUE,
+  extensions = 'Buttons',
+  options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel', 'pdf', 'print'))
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

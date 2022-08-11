@@ -8,20 +8,24 @@ date: '2022-07-29'
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE)
 ```
+
 ```{r, packages, results="hide", , message = FALSE}
 library(tidyverse)
 library(lubridate)
 library(tsibble)
 library(fable)
 library(feasts)
+
 library(patchwork)
 library(GGally)
 library(knitr)
 library(printr)
 library(DT)
 ```
-```{r, import and clean data, results="hide", , message = FALSE}
+
+```{r, import clean and model, results="hide", , message = FALSE}
 google_gl <- read_csv("C:\\Users\\AxelTorbenson\\OneDrive - eCapital Advisors, LLC\\Documents\\templates\\CapitalForecasting\\Data\\gl_google.csv")
+
 gl <- google_gl %>%
   select(
     # date and totals
@@ -71,10 +75,12 @@ gl <- google_gl %>%
       "otherCurrentLiabilities"
     ) ~ "liability")
   )
+
 df <- gl %>%
   mutate(fiscalDateEnding = yearmonth(fiscalDateEnding)) %>%
   as_tsibble(key = dollars, index = fiscalDateEnding) %>%
   aggregate_key((accountType / name), dollars = sum(dollars)) 
+
 ind_models <- df %>% 
   # withholding 5 quarters of data (training)
   filter(year(fiscalDateEnding) <= 2020) %>%
@@ -82,11 +88,13 @@ ind_models <- df %>%
   model(arima = ARIMA(dollars, ic = "aicc"),
         ets = ETS(dollars, ic = "aicc"),
         naive = NAIVE(dollars ~ drift()))
+
 refit_comb <- ind_models %>%
   refit(df) %>%
   mutate(comb = (arima + ets + naive) / 3) %>%
   reconcile(mint_comb = min_trace(comb, method = "mint_shrink")) %>% 
   select(accountType, name, mint_comb)
+
 # refits forecast and uses newest data
 refit_forecast <- refit_comb %>% 
   forecast(h = 5) %>% 
@@ -97,10 +105,12 @@ refit_forecast <- refit_comb %>%
   rename(conf_int = '95%') %>%
   unpack_hilo(conf_int) %>% 
   mutate(type = "forecast")
+
 df_final <- df %>%
   mutate(conf_int_lower = NA,
          conf_int_upper = NA,
          type = "actual")
+
 full_df = union_all(refit_forecast, df_final)
 ```
 
@@ -111,7 +121,12 @@ full_df = union_all(refit_forecast, df_final)
 ### Stacked area assets and Liabilities
 
 ```{r, stacked area charts}
-sa_assets <- gl %>%
+library(highcharter)
+library(htmltools)
+
+# Might need to format these like patchwork:: normally would.
+# https://www.tmbish.me/lab/highcharter-cookbook/#forecast
+hw_grid(gl %>%
   filter(
     name %in% c(
       "fiscalDateEnding",
@@ -122,26 +137,29 @@ sa_assets <- gl %>%
       "otherCurrentAssets"
     )
   ) %>%
-  mutate(name=replace(name, name=="cashAndCashEquivalentsAtCarryingValue", "cash")) %>% 
-  ggplot(aes(x = fiscalDateEnding, y = dollars, fill = name)) +
-  geom_area() +
-  labs(title = "Assets") +
-  scale_fill_brewer(palette = "Pastel1")
-sa_liabilities <- gl %>%
+  arrange(fiscalDateEnding) %>% 
+  hchart(
+    "area",
+    hcaes(fiscalDateEnding, dollars, group = name),
+    stacking = "normal",
+    marker = FALSE
+  ),
+gl %>%
   filter(
     name %in% c(
       "fiscalDateEnding",
       "shortTermDebt",
       "currentAccountsPayable",
       "otherCurrentLiabilities"
-    )
-  ) %>%
+    )) %>% 
+  arrange(fiscalDateEnding) %>% 
   mutate(dollars = abs(dollars)) %>%
-           ggplot(aes(x = fiscalDateEnding, y = dollars, fill = name)) +
-           geom_area() + 
-           labs(title = "Liabilities") +
-           scale_fill_brewer(palette = "Pastel1")
-sa_assets / sa_liabilities
+  hchart(
+    "area",
+    hcaes(fiscalDateEnding, dollars, group = name),
+    stacking = "normal",
+    marker = FALSE
+  ), ncol = 1) %>% browsable()
 ```
 
 ## Column {.tabset .tabset-fade}
@@ -149,14 +167,30 @@ sa_assets / sa_liabilities
 ### Working Capital Forecasting
 
 ```{r, working capital forecast}
-refit_comb %>%
-  forecast(h=5) %>% 
-  filter(is_aggregated(name), is_aggregated(accountType)) %>%
-  filter(.model == "mint_comb") %>% 
-  autoplot(df) +
-  facet_wrap(vars(name), scales = "free_y") +
-  labs(y = "Dollars (millions)", x = "Date", title = "Working Capital forecast") +
-  scale_y_continuous(expand = c(0, 0), limits = c(0, 160000), labels = function(x) format(x, scientific = FALSE)) 
+library(dygraphs)
+library(tsbox)
+
+predictions <- full_df %>% 
+  filter(is_aggregated(name), is_aggregated(accountType), type == "forecast") %>% 
+  mutate(time = fiscalDateEnding) %>% 
+  select(time, dollars, conf_int_lower, conf_int_upper) %>% 
+  as_tsibble() %>% 
+  ts_xts()
+
+actuals <- full_df %>% 
+  filter(is_aggregated(name), is_aggregated(accountType), type == "actual") %>% 
+  mutate(time = fiscalDateEnding) %>% 
+  select(time, dollars) %>% 
+  as_tsibble() %>% 
+  ts_xts()
+
+both <- cbind(actuals, predictions)
+
+dygraph(both, main = "Working Capital Forecast") %>%
+  dySeries("dollars", label = "Actual", color = "gold", strokeWidth = 1.5) %>%
+  dySeries(c("conf_int_lower", "dollars.1", "conf_int_upper"), label = "Predicted", color = "blue", strokeWidth = 1.5) %>% 
+  dyAxis('y', valueRange = c(0, 160000)) %>% 
+  dyOptions(gridLineWidth = 0.05)
 ```
 
 ### Working Capital Simulation
@@ -170,10 +204,11 @@ df %>%
   autoplot(dollars) + 
   autolayer(simulation, .vars = .sim) +
   geom_line() +
-  theme(legend.position = "none") +
   ggtitle("Working Capital Simulation") +
   labs(y = "Dollars (millions)", x = "Date") +
-  scale_y_continuous(expand = c(0, 0), limits = c(0, 160000), labels = function(x) format(x, scientific = FALSE))
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 160000), labels = function(x) format(x, scientific = FALSE)) + 
+  theme_minimal() + 
+  theme(legend.position = "none")
 ```
 
 # GL components forecast
@@ -183,13 +218,26 @@ df %>%
 ### Assets
 
 ```{r, assets}
-refit_comb %>%
-  forecast(h=5) %>% 
-  filter(is_aggregated(name), accountType == "asset") %>%
-  filter(.model == "mint_comb") %>% 
-  autoplot(df) +
-  facet_wrap(vars(name), scales = "free_y") +
-  labs(y = "Dollars (millions)", x = "Date", title = "Assets Forecast")
+predictions <- full_df %>% 
+  filter(is_aggregated(name), accountType == "asset", type == "forecast") %>% 
+  mutate(time = fiscalDateEnding) %>% 
+  select(time, dollars, conf_int_lower, conf_int_upper) %>% 
+  as_tsibble() %>% 
+  ts_xts()
+
+actuals <- full_df %>% 
+  filter(is_aggregated(name), accountType == "asset", type == "actual") %>% 
+  mutate(time = fiscalDateEnding) %>% 
+  select(time, dollars) %>% 
+  as_tsibble() %>% 
+  ts_xts()
+
+both <- cbind(actuals, predictions)
+
+dygraph(both, main = "Current Assets Forecast") %>%
+  dySeries("dollars", label = "Actual", color = "gold", strokeWidth = 1.5) %>%
+  dySeries(c("conf_int_lower", "dollars.1", "conf_int_upper"), label = "Predicted", color = "blue", strokeWidth = 1.5) %>% 
+  dyOptions(gridLineWidth = 0.05)
 ```
 
 ### Asset Components
@@ -204,8 +252,10 @@ components_plot <- function(gl_component, account_type) {
     autoplot(df) +
     facet_wrap(vars(name), scales = "free_y") +
     labs(y = "", x = "") +
+    theme_minimal() +
     theme(legend.position = "none")
 }
+
 (components_plot("cashAndCashEquivalentsAtCarryingValue", "asset") + components_plot("currentNetReceivables", "asset")) /
   (components_plot("inventory", "asset") + components_plot("otherCurrentAssets", "asset")) /
   components_plot("shortTermInvestments", "asset")
@@ -216,13 +266,26 @@ components_plot <- function(gl_component, account_type) {
 ### Liabilities
 
 ```{r, liabilities}
-refit_comb %>%
-  forecast(h=5) %>% 
-  filter(is_aggregated(name), accountType == "liability") %>%
-  filter(.model == "mint_comb") %>% 
-  autoplot(df) +
-  facet_wrap(vars(name), scales = "free_y") +
-  labs(y = "Dollars (millions)", x = "Date", title = "Liabilities Forecast")
+predictions <- full_df %>% 
+  filter(is_aggregated(name), accountType == "liability", type == "forecast") %>% 
+  mutate(time = fiscalDateEnding) %>% 
+  select(time, dollars, conf_int_lower, conf_int_upper) %>% 
+  as_tsibble() %>% 
+  ts_xts()
+
+actuals <- full_df %>% 
+  filter(is_aggregated(name), accountType == "liability", type == "actual") %>% 
+  mutate(time = fiscalDateEnding) %>% 
+  select(time, dollars) %>% 
+  as_tsibble() %>% 
+  ts_xts()
+
+both <- cbind(actuals, predictions)
+
+dygraph(both, main = "Current Liabilities Forecast") %>%
+  dySeries("dollars", label = "Actual", color = "gold", strokeWidth = 1.5) %>%
+  dySeries(c("conf_int_lower", "dollars.1", "conf_int_upper"), label = "Predicted", color = "blue", strokeWidth = 1.5) %>% 
+  dyOptions(gridLineWidth = 0.05)
 ```
 
 ### Liabilities Components
@@ -249,6 +312,7 @@ comb_forecast_accuracy <- ind_models %>%
   accuracy(data = df, measures = c(mape = MAPE, mae = MAE, mase = MASE)) %>% 
   select(accountType, name, mape, mae, mase) %>% 
   mutate(mape = round(mape, 3), mae = round(mae, 3), mase = round(mase, 3))
+
 datatable(comb_forecast_accuracy %>% 
   mutate(accountType = as.character(accountType), name = as.character(name)),
   class = 'cell-border stripe')
@@ -326,6 +390,7 @@ collapsibleTreeNetwork(hierarchy, attribute = "Category",
                        fill = "color")
 ```
 
+
 # Data
 
 ## Column
@@ -339,13 +404,11 @@ table_df <- full_df %>%
          fiscalDateEnding = as.character(fiscalDateEnding)) %>% 
   mutate_if(is.numeric, round, 2) %>% 
   mutate(name=replace(name, name=="cashAndCashEquivalentsAtCarryingValue", "cash"))
+
+
 datatable(
   table_df,
   class = 'cell-border stripe',
-  fillContainer = TRUE,  
-  extensions = 'Buttons',
-  options = list(
-    dom = 'Bfrtip',
-    buttons = c('copy', 'csv', 'excel', 'pdf', 'print'))
-)
+  fillContainer = TRUE
+  )
 ```
